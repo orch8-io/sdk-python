@@ -48,7 +48,9 @@ class Orch8Worker:
         self.handlers = handlers
         self.poll_interval = poll_interval
         self.heartbeat_interval = heartbeat_interval
+        self._max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._in_flight = 0
         self._running = False
         self._tasks: set[asyncio.Task[None]] = set()
 
@@ -81,11 +83,14 @@ class Orch8Worker:
                 t.cancel()
 
     async def _poll_handler(self, handler_name: str) -> None:
+        remaining = self._max_concurrent - self._in_flight
+        if remaining <= 0:
+            return
         try:
             tasks = await self.client.poll_tasks(
                 handler_name=handler_name,
                 worker_id=self.worker_id,
-                limit=self._semaphore._value,  # noqa: SLF001 — remaining capacity
+                limit=remaining,
             )
         except Exception:
             logger.exception("poll error for handler %s", handler_name)
@@ -93,9 +98,10 @@ class Orch8Worker:
 
         for task in tasks:
             await self._semaphore.acquire()
+            self._in_flight += 1
             t = asyncio.create_task(self._execute(task))
-            self._tasks.add(t)
             t.add_done_callback(self._tasks.discard)
+            self._tasks.add(t)
 
     async def _execute(self, task: WorkerTask) -> None:
         heartbeat_handle: asyncio.Task[None] | None = None
@@ -115,6 +121,7 @@ class Orch8Worker:
         finally:
             if heartbeat_handle is not None:
                 heartbeat_handle.cancel()
+            self._in_flight -= 1
             self._semaphore.release()
 
     async def _heartbeat_loop(self, task_id: str) -> None:
