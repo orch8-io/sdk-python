@@ -1,4 +1,6 @@
 """Orch8 SDK for Python."""
+from importlib.metadata import version as _version
+
 from .client import Orch8Client
 from .errors import Orch8Error
 from .types import (
@@ -25,6 +27,11 @@ from .types import (
     WorkerTask,
 )
 from .worker import Orch8Worker
+
+try:
+    __version__ = _version("orch8-sdk")
+except Exception:
+    __version__ = "unknown"
 
 __all__ = [
     "AuditEntry",

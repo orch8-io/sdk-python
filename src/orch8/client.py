@@ -238,22 +238,22 @@ class Orch8Client:
     # -- Bulk --
 
     async def bulk_update_state(
-        self, filter: dict[str, Any], state: str
+        self, criteria: dict[str, Any], state: str
     ) -> BulkResponse:
         data = await self._request(
             "PATCH",
             "/instances/bulk/state",
-            json={"filter": filter, "state": state},
+            json={"filter": criteria, "state": state},
         )
         return BulkResponse.model_validate(data)
 
     async def bulk_reschedule(
-        self, filter: dict[str, Any], offset_secs: int
+        self, criteria: dict[str, Any], offset_secs: int
     ) -> BulkResponse:
         data = await self._request(
             "PATCH",
             "/instances/bulk/reschedule",
-            json={"filter": filter, "offset_secs": offset_secs},
+            json={"filter": criteria, "offset_secs": offset_secs},
         )
         return BulkResponse.model_validate(data)
 
@@ -618,5 +618,5 @@ class Orch8Client:
         try:
             await self._request("GET", "/health/ready")
             return HealthResponse(status="ok")
-        except Orch8Error:
+        except (Orch8Error, httpx.NetworkError, httpx.TimeoutException):
             return HealthResponse(status="unavailable")

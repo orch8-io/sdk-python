@@ -56,6 +56,7 @@ class Orch8Worker:
         self._in_flight = 0
         self._running = False
         self._tasks: set[asyncio.Task[None]] = set()
+        self._poll_tasks: set[asyncio.Task[None]] = set()
         self._circuit_breaker_check = circuit_breaker_check
         self._on_task_complete = on_task_complete
         self._on_task_fail = on_task_fail
@@ -64,26 +65,46 @@ class Orch8Worker:
     async def start(self) -> None:
         """Start the polling loop. Blocks until :meth:`stop` is called."""
         self._running = True
-        logger.info("worker %s starting (handlers=%s)", self.worker_id, list(self.handlers))
+        logger.info(
+            "worker %s starting (handlers=%s)", self.worker_id, list(self.handlers)
+        )
         try:
             poll_loops = [
                 asyncio.create_task(self._poll_loop(name))
                 for name in self.handlers
             ]
-            await asyncio.gather(*poll_loops)
+            self._poll_tasks.update(poll_loops)
+            results = await asyncio.gather(*poll_loops, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(
+                    result, asyncio.CancelledError
+                ):
+                    logger.exception("poll loop terminated with error")
         finally:
             self._running = False
+            self._poll_tasks.clear()
 
     async def _poll_loop(self, handler_name: str) -> None:
         """Independent polling loop for a single handler."""
-        while self._running:
-            await self._poll_handler(handler_name)
-            interval = self._backoff.get(handler_name, self.poll_interval)
-            await asyncio.sleep(interval)
+        try:
+            while self._running:
+                await self._poll_handler(handler_name)
+                interval = self._backoff.get(handler_name, self.poll_interval)
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            logger.debug("poll loop for %s cancelled", handler_name)
+            raise
 
     async def stop(self, timeout: float = 30.0) -> None:
         """Signal the worker to stop and wait for in-flight tasks."""
         self._running = False
+        # Cancel poll loops first so they stop sleeping/polling
+        for t in list(self._poll_tasks):
+            if not t.done():
+                t.cancel()
+        if self._poll_tasks:
+            await asyncio.wait(self._poll_tasks, timeout=timeout)
+        # Wait for in-flight execution tasks
         if self._tasks:
             logger.info("waiting for %d in-flight tasks", len(self._tasks))
             _, pending = await asyncio.wait(self._tasks, timeout=timeout)
@@ -105,6 +126,8 @@ class Orch8Worker:
                         handler_name,
                     )
                     return
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.warning(
                     "circuit breaker check failed for %s, polling anyway",
@@ -117,6 +140,8 @@ class Orch8Worker:
                 worker_id=self.worker_id,
                 limit=remaining,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("poll error for handler %s", handler_name)
             # Exponential backoff on poll failure
@@ -145,14 +170,20 @@ class Orch8Worker:
                 try:
                     self._on_task_complete(task, output)
                 except Exception:
-                    logger.exception("on_task_complete callback error for task %s", task.id)
+                    logger.exception(
+                        "on_task_complete callback error for task %s", task.id
+                    )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.exception("task %s failed", task.id)
             if self._on_task_fail is not None:
                 try:
                     self._on_task_fail(task, exc)
                 except Exception:
-                    logger.exception("on_task_fail callback error for task %s", task.id)
+                    logger.exception(
+                        "on_task_fail callback error for task %s", task.id
+                    )
             try:
                 await self.client.fail_task(
                     task.id, self.worker_id, str(exc), retryable=False
@@ -166,9 +197,15 @@ class Orch8Worker:
             self._semaphore.release()
 
     async def _heartbeat_loop(self, task_id: str) -> None:
-        while True:
-            await asyncio.sleep(self.heartbeat_interval)
-            try:
-                await self.client.heartbeat_task(task_id, self.worker_id)
-            except Exception:
-                logger.exception("heartbeat error for task %s", task_id)
+        try:
+            while True:
+                await asyncio.sleep(self.heartbeat_interval)
+                try:
+                    await self.client.heartbeat_task(task_id, self.worker_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("heartbeat error for task %s", task_id)
+        except asyncio.CancelledError:
+            logger.debug("heartbeat loop for task %s cancelled", task_id)
+            raise

@@ -448,7 +448,7 @@ async def test_bulk_update_state(client: Orch8Client) -> None:
         return_value=httpx.Response(200, json={"updated": 10})
     )
     result = await client.bulk_update_state(
-        filter={"tenant_id": "t-1"}, state="cancelled"
+        criteria={"tenant_id": "t-1"}, state="cancelled"
     )
     assert isinstance(result, BulkResponse)
     assert result.updated == 10
@@ -460,7 +460,7 @@ async def test_bulk_reschedule(client: Orch8Client) -> None:
         return_value=httpx.Response(200, json={"updated": 4})
     )
     result = await client.bulk_reschedule(
-        filter={"tenant_id": "t-1"}, offset_secs=300
+        criteria={"tenant_id": "t-1"}, offset_secs=300
     )
     assert isinstance(result, BulkResponse)
     assert result.updated == 4
