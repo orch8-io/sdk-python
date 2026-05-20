@@ -462,13 +462,14 @@ class Orch8Client:
     async def poll_tasks_from_queue(
         self,
         queue: str,
+        handler_name: str,
         worker_id: str,
         limit: int = 1,
     ) -> list[WorkerTask]:
         data = await self._request(
             "POST",
             "/workers/tasks/poll/queue",
-            json={"queue": queue, "worker_id": worker_id, "limit": limit},
+            json={"queue_name": queue, "handler_name": handler_name, "worker_id": worker_id, "limit": limit},
         )
         return [WorkerTask.model_validate(d) for d in data]
 

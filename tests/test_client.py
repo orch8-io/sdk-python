@@ -972,7 +972,7 @@ async def test_poll_tasks_from_queue(client: Orch8Client) -> None:
         return_value=httpx.Response(200, json=[WORKER_TASK_JSON])
     )
     result = await client.poll_tasks_from_queue(
-        queue="high-priority", worker_id="w-1", limit=3
+        queue="high-priority", handler_name="my-handler", worker_id="w-1", limit=3
     )
     assert isinstance(result, list)
     assert len(result) == 1

@@ -74,7 +74,6 @@ class StepOutput(BaseModel):
     output_ref: str | None = None
     output_size: int = 0
     attempt: int = 0
-    error_message: str | None = None
     created_at: str
 
 
@@ -154,6 +153,7 @@ class WorkerTask(BaseModel):
     instance_id: str
     block_id: str
     handler_name: str
+    queue_name: str | None = None
     params: Any = None
     context: Any = None
     attempt: int = 0
