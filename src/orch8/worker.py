@@ -184,9 +184,10 @@ class Orch8Worker:
                     logger.exception(
                         "on_task_fail callback error for task %s", task.id
                     )
+            retryable = getattr(exc, "retryable", False)
             try:
                 await self.client.fail_task(
-                    task.id, self.worker_id, str(exc), retryable=False
+                    task.id, self.worker_id, str(exc), retryable=retryable
                 )
             except Exception:
                 logger.exception("failed to report failure for task %s", task.id)

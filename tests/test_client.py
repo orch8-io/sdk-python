@@ -927,14 +927,25 @@ async def test_inject_blocks(client: Orch8Client) -> None:
 
 @respx.mock
 async def test_list_approvals(client: Orch8Client) -> None:
+    approval_json = {
+        "instance_id": "inst-1",
+        "tenant_id": "t-1",
+        "namespace": "default",
+        "sequence_id": "seq-1",
+        "sequence_name": "my-seq",
+        "block_id": "block-1",
+        "prompt": "Approve?",
+        "waiting_since": TS,
+    }
     respx.get(f"{BASE}/approvals").mock(
-        return_value=httpx.Response(200, json=[INSTANCE_JSON])
+        return_value=httpx.Response(200, json={"items": [approval_json], "total": 1})
     )
     result = await client.list_approvals()
-    assert isinstance(result, list)
-    assert len(result) == 1
-    assert isinstance(result[0], TaskInstance)
-    assert result[0].id == "inst-1"
+    from orch8.types import ApprovalsResponse
+    assert isinstance(result, ApprovalsResponse)
+    assert len(result.items) == 1
+    assert result.items[0].instance_id == "inst-1"
+    assert result.total == 1
 
 
 # ---------------------------------------------------------------------------
