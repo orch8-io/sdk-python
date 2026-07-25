@@ -1,8 +1,15 @@
 """Orch8 async management client wrapping the REST API."""
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
+from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel
@@ -25,6 +32,7 @@ from .types import (
     CreateInstanceRequest,
     CreatePoolRequest,
     CreateSessionRequest,
+    CreateSequenceResponse,
     CreateTriggerRequest,
     Credential,
     CronSchedule,
@@ -41,6 +49,10 @@ from .types import (
     RegisterDeviceRequest,
     ResolveApprovalRequest,
     ResourcePool,
+    RetryConfig,
+    RequestEvent,
+    ResponseEvent,
+    Page,
     RollbackPolicy,
     SequenceDefinition,
     SendSignalRequest,
@@ -68,6 +80,13 @@ class Orch8Client:
         base_url: str,
         tenant_id: str | None = None,
         headers: dict[str, str] | None = None,
+        get_headers: Callable[
+            [], Mapping[str, str] | Awaitable[Mapping[str, str]]
+        ] | None = None,
+        retry: RetryConfig | bool = True,
+        timeout: float = 30.0,
+        on_request: Callable[[RequestEvent], None] | None = None,
+        on_response: Callable[[ResponseEvent], None] | None = None,
     ) -> None:
         h: dict[str, str] = {"Content-Type": "application/json"}
         if tenant_id:
@@ -76,7 +95,13 @@ class Orch8Client:
             h.update(headers)
         self.base_url = base_url.rstrip("/")
         self.headers = h
-        self._http = httpx.AsyncClient(base_url=self.base_url, headers=self.headers)
+        self.get_headers = get_headers
+        self.retry = RetryConfig() if retry is True else retry
+        self.on_request = on_request
+        self.on_response = on_response
+        self._http = httpx.AsyncClient(
+            base_url=self.base_url, headers=self.headers, timeout=timeout
+        )
 
     # -- context manager --
 
@@ -89,7 +114,7 @@ class Orch8Client:
     async def close(self) -> None:
         await self._http.aclose()
 
-    # -- internal --
+    # -- low-level API --
 
     @staticmethod
     def _body(value: BaseModel | dict[str, Any]) -> dict[str, Any]:
@@ -97,26 +122,164 @@ class Orch8Client:
             return value.model_dump(exclude_none=True)
         return value
 
+    @staticmethod
+    def _e(segment: str) -> str:
+        return quote(segment, safe="")
+
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        resp = await self._http.request(method, path, **kwargs)
-        if resp.status_code == 204:
-            return None
-        if resp.status_code >= 400:
-            raise Orch8Error(resp.status_code, resp.text, path)
-        if not resp.content:
-            return None
-        return resp.json()
+        normalized_method = method.upper()
+        safe = normalized_method in {"GET", "HEAD"}
+        config = self.retry if isinstance(self.retry, RetryConfig) else None
+        max_attempts = max(1, config.max_attempts) if config and safe else 1
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            event = RequestEvent(
+                method=normalized_method,
+                path=path,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
+            started_at = time.perf_counter()
+            self._observe(self.on_request, event)
+            try:
+                request_kwargs = dict(kwargs)
+                if self.get_headers:
+                    dynamic = self.get_headers()
+                    if inspect.isawaitable(dynamic):
+                        dynamic = await dynamic
+                    request_kwargs["headers"] = {
+                        **request_kwargs.get("headers", {}),
+                        **dict(dynamic),
+                    }
+                resp = await self._http.request(
+                    normalized_method, path, **request_kwargs
+                )
+                if resp.status_code >= 400:
+                    error = Orch8Error(resp.status_code, resp.text, path)
+                    self._observe(
+                        self.on_response,
+                        ResponseEvent(
+                            **event.model_dump(),
+                            duration_ms=(time.perf_counter() - started_at) * 1000,
+                            status=resp.status_code,
+                            error=error,
+                        ),
+                    )
+                    if (
+                        self._is_retryable_status(resp.status_code)
+                        and attempt < max_attempts
+                    ):
+                        await self._retry(error, attempt, config)
+                        continue
+                    raise error
+                if resp.status_code == 204 or not resp.content:
+                    self._observe(
+                        self.on_response,
+                        ResponseEvent(
+                            **event.model_dump(),
+                            duration_ms=(time.perf_counter() - started_at) * 1000,
+                            status=resp.status_code,
+                        ),
+                    )
+                    return None
+                self._observe(
+                    self.on_response,
+                    ResponseEvent(
+                        **event.model_dump(),
+                        duration_ms=(time.perf_counter() - started_at) * 1000,
+                        status=resp.status_code,
+                    ),
+                )
+                return resp.json()
+            except Orch8Error:
+                raise
+            except httpx.TransportError as error:
+                last_error = error
+                self._observe(
+                    self.on_response,
+                    ResponseEvent(
+                        **event.model_dump(),
+                        duration_ms=(time.perf_counter() - started_at) * 1000,
+                        error=error,
+                    ),
+                )
+                if attempt >= max_attempts:
+                    raise
+                await self._retry(error, attempt, config)
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("request attempts exhausted")
+
+    @staticmethod
+    def _observe(observer: Callable[[Any], None] | None, event: Any) -> None:
+        try:
+            if observer:
+                observer(event)
+        except Exception:
+            # Observability must never change request behavior.
+            pass
+
+    @staticmethod
+    def _is_retryable_status(status: int) -> bool:
+        return status in {408, 425, 429} or status >= 500
+
+    @staticmethod
+    async def _retry(
+        error: Exception, attempt: int, config: RetryConfig | None
+    ) -> None:
+        if not config:
+            return
+        if config.on_retry:
+            config.on_retry(error, attempt + 1)
+        delay = config.base_delay * (2 ** (attempt - 1))
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    async def request(self, method: str, path: str, **kwargs: Any) -> Any:
+        """Call an engine endpoint not yet covered by a convenience method.
+
+        ``path`` must be relative to the configured engine origin.  This keeps
+        authentication and tenant headers on the configured host and makes new
+        engine endpoints immediately accessible as the API evolves.
+        """
+        if not path.startswith("/") or path.startswith("//"):
+            raise ValueError("path must start with exactly one '/' character")
+        return await self._request(method.upper(), path, **kwargs)
+
+    async def request_page(
+        self, path: str, params: dict[str, Any] | None = None
+    ) -> Page[Any]:
+        """Request a list endpoint without discarding cursor metadata."""
+        data = await self.request("GET", path, params=params or {})
+        if isinstance(data, list):
+            return Page(items=data)
+        return Page.model_validate(data)
 
     # ------------------------------------------------------------------ #
     # Sequences
     # ------------------------------------------------------------------ #
 
-    async def create_sequence(self, definition: dict[str, Any]) -> SequenceDefinition:
-        data = await self._request("POST", "/sequences", json=definition)
-        return SequenceDefinition.model_validate(data)
+    async def create_sequence(self, definition: dict[str, Any]) -> CreateSequenceResponse:
+        tenant_id = definition.get("tenant_id") or self.headers.get("X-Tenant-Id")
+        if not tenant_id:
+            raise ValueError("tenant_id is required to create a sequence")
+        prepared = dict(definition)
+        prepared["id"] = definition.get("id") or str(uuid4())
+        prepared["tenant_id"] = tenant_id
+        prepared["namespace"] = definition.get("namespace") or "default"
+        prepared["version"] = definition.get("version") or 1
+        prepared["deprecated"] = definition.get("deprecated", False)
+        prepared["status"] = definition.get("status") or "production"
+        prepared["created_at"] = definition.get("created_at") or datetime.now(
+            timezone.utc
+        ).isoformat().replace("+00:00", "Z")
+        data = await self._request("POST", "/sequences", json=prepared)
+        return CreateSequenceResponse.model_validate(data)
 
     async def get_sequence(self, sequence_id: str) -> SequenceDefinition:
-        data = await self._request("GET", f"/sequences/{sequence_id}")
+        data = await self._request("GET", f"/sequences/{self._e(sequence_id)}")
         return SequenceDefinition.model_validate(data)
 
     async def get_sequence_by_name(
@@ -138,17 +301,19 @@ class Orch8Client:
 
     async def list_sequences(self, **filters: Any) -> list[SequenceDefinition]:
         data = await self._request("GET", "/sequences", params=filters)
+        if isinstance(data, dict):
+            data = data.get("items", [])
         return [SequenceDefinition.model_validate(d) for d in data]
 
     async def delete_sequence(self, sequence_id: str) -> None:
-        await self._request("DELETE", f"/sequences/{sequence_id}")
+        await self._request("DELETE", f"/sequences/{self._e(sequence_id)}")
 
     async def migrate_instance(self, body: dict[str, Any]) -> TaskInstance:
         data = await self._request("POST", "/sequences/migrate-instance", json=body)
         return TaskInstance.model_validate(data)
 
     async def deprecate_sequence(self, sequence_id: str) -> None:
-        await self._request("POST", f"/sequences/{sequence_id}/deprecate")
+        await self._request("POST", f"/sequences/{self._e(sequence_id)}/deprecate")
 
     async def list_sequence_versions(
         self, tenant_id: str, namespace: str, name: str
@@ -164,24 +329,39 @@ class Orch8Client:
     async def create_instance(
         self, body: dict[str, Any] | CreateInstanceRequest
     ) -> TaskInstance:
-        data = await self._request("POST", "/instances", json=self._body(body))
+        data = await self._request(
+            "POST", "/instances", json=self._prepare_instance(self._body(body))
+        )
         return TaskInstance.model_validate(data)
 
     async def batch_create_instances(
         self, instances: list[dict[str, Any]]
     ) -> BatchCreateResponse:
         data = await self._request(
-            "POST", "/instances/batch", json={"instances": instances}
+            "POST",
+            "/instances/batch",
+            json={"instances": [self._prepare_instance(item) for item in instances]},
         )
         return BatchCreateResponse.model_validate(data)
 
     async def get_instance(self, instance_id: str) -> TaskInstance:
-        data = await self._request("GET", f"/instances/{instance_id}")
+        data = await self._request("GET", f"/instances/{self._e(instance_id)}")
         return TaskInstance.model_validate(data)
 
     async def list_instances(self, **filters: Any) -> list[TaskInstance]:
         data = await self._request("GET", "/instances", params=filters)
+        if isinstance(data, dict):
+            data = data.get("items", [])
         return [TaskInstance.model_validate(d) for d in data]
+
+    def _prepare_instance(self, body: dict[str, Any]) -> dict[str, Any]:
+        tenant_id = body.get("tenant_id") or self.headers.get("X-Tenant-Id")
+        if not tenant_id:
+            raise ValueError("tenant_id is required to create an instance")
+        prepared = dict(body)
+        prepared["tenant_id"] = tenant_id
+        prepared["namespace"] = body.get("namespace") or "default"
+        return prepared
 
     async def update_instance_state(
         self,
@@ -196,7 +376,7 @@ class Orch8Client:
             if next_fire_at is not None:
                 body["next_fire_at"] = next_fire_at
         await self._request(
-            "PATCH", f"/instances/{instance_id}/state", json=body
+            "PATCH", f"/instances/{self._e(instance_id)}/state", json=body
         )
 
     async def update_instance_context(
@@ -209,7 +389,7 @@ class Orch8Client:
         else:
             body = {"context": context}
         await self._request(
-            "PATCH", f"/instances/{instance_id}/context", json=body
+            "PATCH", f"/instances/{self._e(instance_id)}/context", json=body
         )
 
     async def send_signal(
@@ -225,38 +405,84 @@ class Orch8Client:
             if payload is not None:
                 body["payload"] = payload
         return await self._request(
-            "POST", f"/instances/{instance_id}/signals", json=body
+            "POST", f"/instances/{self._e(instance_id)}/signals", json=body
         )
 
     async def get_outputs(self, instance_id: str) -> list[StepOutput]:
-        data = await self._request("GET", f"/instances/{instance_id}/outputs")
+        data = await self._request("GET", f"/instances/{self._e(instance_id)}/outputs")
         return [StepOutput.model_validate(d) for d in data]
 
     async def get_execution_tree(self, instance_id: str) -> list[ExecutionNode]:
-        data = await self._request("GET", f"/instances/{instance_id}/tree")
+        data = await self._request("GET", f"/instances/{self._e(instance_id)}/tree")
         return [ExecutionNode.model_validate(d) for d in data]
 
     async def retry_instance(self, instance_id: str) -> TaskInstance:
-        data = await self._request("POST", f"/instances/{instance_id}/retry")
+        data = await self._request("POST", f"/instances/{self._e(instance_id)}/retry")
         return TaskInstance.model_validate(data)
 
-    async def stream_instance(self, instance_id: str, poll_ms: int = 500):
+    async def stream_instance(
+        self, instance_id: str, poll_ms: int = 500
+    ) -> AsyncIterator[dict[str, Any]]:
         """SSE stream for instance state/output/done events.
 
         poll_ms must be between 100 and 5000 (inclusive).
         """
+        async for event in self.stream_instance_events(instance_id, poll_ms=poll_ms):
+            yield event["data"]
+
+    async def stream_instance_events(
+        self,
+        instance_id: str,
+        *,
+        poll_ms: int = 500,
+        last_event_id: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream SSE envelopes and expose IDs that can resume a later stream."""
         poll_ms = max(100, min(poll_ms, 5000))
+        dynamic_headers: dict[str, str] = {"Accept": "text/event-stream"}
+        if last_event_id:
+            dynamic_headers["Last-Event-ID"] = last_event_id
+        if self.get_headers:
+            resolved = self.get_headers()
+            if inspect.isawaitable(resolved):
+                resolved = await resolved
+            dynamic_headers.update(resolved)
         async with self._http.stream(
-            "GET", f"/instances/{instance_id}/stream", params={"poll_ms": poll_ms}, timeout=None
+            "GET",
+            f"/instances/{self._e(instance_id)}/stream",
+            params={"poll_ms": poll_ms},
+            headers=dynamic_headers,
+            timeout=None,
         ) as response:
+            if response.status_code >= 400:
+                body = (await response.aread()).decode(errors="replace")
+                raise Orch8Error(response.status_code, body, str(response.request.url.path))
+            event_id: str | None = None
+            event_type: str | None = None
+            event_data: list[str] = []
             async for line in response.aiter_lines():
-                if line.startswith("data: "):
-                    yield json.loads(line[6:])
+                if line.startswith("id:"):
+                    event_id = line[3:].strip()
+                elif line.startswith("event:"):
+                    event_type = line[6:].strip()
+                elif line.startswith("data:"):
+                    event_data.append(line[5:].lstrip())
+                elif not line and event_data:
+                    raw = "\n".join(event_data)
+                    event_data = []
+                    if raw != "[DONE]":
+                        yield {"id": event_id, "event": event_type, "data": json.loads(raw)}
+                    event_id = None
+                    event_type = None
+            if event_data:
+                raw = "\n".join(event_data)
+                if raw != "[DONE]":
+                    yield {"id": event_id, "event": event_type, "data": json.loads(raw)}
 
     # -- Checkpoints --
 
     async def list_checkpoints(self, instance_id: str) -> list[Checkpoint]:
-        data = await self._request("GET", f"/instances/{instance_id}/checkpoints")
+        data = await self._request("GET", f"/instances/{self._e(instance_id)}/checkpoints")
         return [Checkpoint.model_validate(d) for d in data]
 
     async def save_checkpoint(
@@ -264,14 +490,14 @@ class Orch8Client:
     ) -> Checkpoint:
         data = await self._request(
             "POST",
-            f"/instances/{instance_id}/checkpoints",
+            f"/instances/{self._e(instance_id)}/checkpoints",
             json={"checkpoint_data": checkpoint_data},
         )
         return Checkpoint.model_validate(data)
 
     async def get_latest_checkpoint(self, instance_id: str) -> Checkpoint:
         data = await self._request(
-            "GET", f"/instances/{instance_id}/checkpoints/latest"
+            "GET", f"/instances/{self._e(instance_id)}/checkpoints/latest"
         )
         return Checkpoint.model_validate(data)
 
@@ -280,7 +506,7 @@ class Orch8Client:
     ) -> BulkResponse:
         data = await self._request(
             "POST",
-            f"/instances/{instance_id}/checkpoints/prune",
+            f"/instances/{self._e(instance_id)}/checkpoints/prune",
             json={"keep": keep},
         )
         return BulkResponse.model_validate(data)
@@ -292,14 +518,14 @@ class Orch8Client:
     ) -> None:
         await self._request(
             "POST",
-            f"/instances/{instance_id}/inject-blocks",
+            f"/instances/{self._e(instance_id)}/inject-blocks",
             json={"blocks": blocks},
         )
 
     # -- Audit --
 
     async def list_audit_log(self, instance_id: str) -> list[AuditEntry]:
-        data = await self._request("GET", f"/instances/{instance_id}/audit")
+        data = await self._request("GET", f"/instances/{self._e(instance_id)}/audit")
         return [AuditEntry.model_validate(d) for d in data]
 
     # -- Bulk --
@@ -354,17 +580,17 @@ class Orch8Client:
         return [CronSchedule.model_validate(d) for d in data]
 
     async def get_cron(self, cron_id: str) -> CronSchedule:
-        data = await self._request("GET", f"/cron/{cron_id}")
+        data = await self._request("GET", f"/cron/{self._e(cron_id)}")
         return CronSchedule.model_validate(data)
 
     async def update_cron(
         self, cron_id: str, body: dict[str, Any] | UpdateCronRequest
     ) -> CronSchedule:
-        data = await self._request("PUT", f"/cron/{cron_id}", json=self._body(body))
+        data = await self._request("PUT", f"/cron/{self._e(cron_id)}", json=self._body(body))
         return CronSchedule.model_validate(data)
 
     async def delete_cron(self, cron_id: str) -> None:
-        await self._request("DELETE", f"/cron/{cron_id}")
+        await self._request("DELETE", f"/cron/{self._e(cron_id)}")
 
     # ------------------------------------------------------------------ #
     # Triggers
@@ -386,17 +612,17 @@ class Orch8Client:
         return [TriggerDef.model_validate(d) for d in data]
 
     async def get_trigger(self, slug: str) -> TriggerDef:
-        data = await self._request("GET", f"/triggers/{slug}")
+        data = await self._request("GET", f"/triggers/{self._e(slug)}")
         return TriggerDef.model_validate(data)
 
     async def delete_trigger(self, slug: str) -> None:
-        await self._request("DELETE", f"/triggers/{slug}")
+        await self._request("DELETE", f"/triggers/{self._e(slug)}")
 
     async def fire_trigger(
         self, slug: str, payload: Any = None
     ) -> FireTriggerResponse:
         data = await self._request(
-            "POST", f"/triggers/{slug}/fire", json=payload or {}
+            "POST", f"/triggers/{self._e(slug)}/fire", json=payload or {}
         )
         return FireTriggerResponse.model_validate(data)
 
@@ -418,17 +644,17 @@ class Orch8Client:
         return [PluginDef.model_validate(d) for d in data]
 
     async def get_plugin(self, name: str) -> PluginDef:
-        data = await self._request("GET", f"/plugins/{name}")
+        data = await self._request("GET", f"/plugins/{self._e(name)}")
         return PluginDef.model_validate(data)
 
     async def update_plugin(
         self, name: str, body: dict[str, Any]
     ) -> PluginDef:
-        data = await self._request("PATCH", f"/plugins/{name}", json=body)
+        data = await self._request("PATCH", f"/plugins/{self._e(name)}", json=body)
         return PluginDef.model_validate(data)
 
     async def delete_plugin(self, name: str) -> None:
-        await self._request("DELETE", f"/plugins/{name}")
+        await self._request("DELETE", f"/plugins/{self._e(name)}")
 
     # ------------------------------------------------------------------ #
     # Sessions
@@ -441,12 +667,12 @@ class Orch8Client:
         return Session.model_validate(data)
 
     async def get_session(self, session_id: str) -> Session:
-        data = await self._request("GET", f"/sessions/{session_id}")
+        data = await self._request("GET", f"/sessions/{self._e(session_id)}")
         return Session.model_validate(data)
 
     async def get_session_by_key(self, tenant_id: str, key: str) -> Session:
         data = await self._request(
-            "GET", f"/sessions/by-key/{tenant_id}/{key}"
+            "GET", f"/sessions/by-key/{self._e(tenant_id)}/{self._e(key)}"
         )
         return Session.model_validate(data)
 
@@ -454,20 +680,20 @@ class Orch8Client:
         self, session_id: str, data: Any
     ) -> None:
         await self._request(
-            "PATCH", f"/sessions/{session_id}/data", json={"data": data}
+            "PATCH", f"/sessions/{self._e(session_id)}/data", json={"data": data}
         )
 
     async def update_session_state(
         self, session_id: str, state: str
     ) -> None:
         await self._request(
-            "PATCH", f"/sessions/{session_id}/state", json={"state": state}
+            "PATCH", f"/sessions/{self._e(session_id)}/state", json={"state": state}
         )
 
     async def list_session_instances(
         self, session_id: str
     ) -> list[TaskInstance]:
-        data = await self._request("GET", f"/sessions/{session_id}/instances")
+        data = await self._request("GET", f"/sessions/{self._e(session_id)}/instances")
         return [TaskInstance.model_validate(d) for d in data]
 
     # ------------------------------------------------------------------ #
@@ -496,7 +722,7 @@ class Orch8Client:
     ) -> None:
         await self._request(
             "POST",
-            f"/workers/tasks/{task_id}/complete",
+            f"/workers/tasks/{self._e(task_id)}/complete",
             json={"worker_id": worker_id, "output": output},
         )
 
@@ -509,7 +735,7 @@ class Orch8Client:
     ) -> None:
         await self._request(
             "POST",
-            f"/workers/tasks/{task_id}/fail",
+            f"/workers/tasks/{self._e(task_id)}/fail",
             json={
                 "worker_id": worker_id,
                 "message": message,
@@ -517,11 +743,24 @@ class Orch8Client:
             },
         )
 
-    async def heartbeat_task(self, task_id: str, worker_id: str) -> None:
-        await self._request(
+    async def heartbeat_task(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        checkpoint: Any = None,
+        checkpoint_seq: int | None = None,
+    ) -> dict[str, int]:
+        body: dict[str, Any] = {"worker_id": worker_id}
+        if checkpoint is not None:
+            if checkpoint_seq is None:
+                raise ValueError("checkpoint_seq is required with checkpoint")
+            body["checkpoint"] = checkpoint
+            body["checkpoint_seq"] = checkpoint_seq
+        return await self._request(
             "POST",
-            f"/workers/tasks/{task_id}/heartbeat",
-            json={"worker_id": worker_id},
+            f"/workers/tasks/{self._e(task_id)}/heartbeat",
+            json=body,
         )
 
     async def list_worker_tasks(self, **filters: Any) -> list[WorkerTask]:
@@ -555,7 +794,7 @@ class Orch8Client:
         return [ClusterNode.model_validate(d) for d in data]
 
     async def drain_node(self, node_id: str) -> None:
-        await self._request("POST", f"/cluster/nodes/{node_id}/drain")
+        await self._request("POST", f"/cluster/nodes/{self._e(node_id)}/drain")
 
     # ------------------------------------------------------------------ #
     # Circuit Breakers
@@ -566,11 +805,11 @@ class Orch8Client:
         return [CircuitBreaker.model_validate(d) for d in data]
 
     async def get_circuit_breaker(self, handler: str) -> CircuitBreaker:
-        data = await self._request("GET", f"/circuit-breakers/{handler}")
+        data = await self._request("GET", f"/circuit-breakers/{self._e(handler)}")
         return CircuitBreaker.model_validate(data)
 
     async def reset_circuit_breaker(self, handler: str) -> None:
-        await self._request("POST", f"/circuit-breakers/{handler}/reset")
+        await self._request("POST", f"/circuit-breakers/{self._e(handler)}/reset")
 
     # ------------------------------------------------------------------ #
     # Circuit Breakers (per-tenant)
@@ -580,7 +819,7 @@ class Orch8Client:
         self, tenant_id: str
     ) -> list[CircuitBreaker]:
         data = await self._request(
-            "GET", f"/tenants/{tenant_id}/circuit-breakers"
+            "GET", f"/tenants/{self._e(tenant_id)}/circuit-breakers"
         )
         return [CircuitBreaker.model_validate(d) for d in data]
 
@@ -588,7 +827,7 @@ class Orch8Client:
         self, tenant_id: str, handler: str
     ) -> CircuitBreaker:
         data = await self._request(
-            "GET", f"/tenants/{tenant_id}/circuit-breakers/{handler}"
+            "GET", f"/tenants/{self._e(tenant_id)}/circuit-breakers/{self._e(handler)}"
         )
         return CircuitBreaker.model_validate(data)
 
@@ -596,7 +835,7 @@ class Orch8Client:
         self, tenant_id: str, handler: str
     ) -> None:
         await self._request(
-            "POST", f"/tenants/{tenant_id}/circuit-breakers/{handler}/reset"
+            "POST", f"/tenants/{self._e(tenant_id)}/circuit-breakers/{self._e(handler)}/reset"
         )
 
     # ------------------------------------------------------------------ #
@@ -619,23 +858,23 @@ class Orch8Client:
         return ResourcePool.model_validate(data)
 
     async def get_pool(self, pool_id: str) -> ResourcePool:
-        data = await self._request("GET", f"/pools/{pool_id}")
+        data = await self._request("GET", f"/pools/{self._e(pool_id)}")
         return ResourcePool.model_validate(data)
 
     async def delete_pool(self, pool_id: str) -> None:
-        await self._request("DELETE", f"/pools/{pool_id}")
+        await self._request("DELETE", f"/pools/{self._e(pool_id)}")
 
     async def list_pool_resources(
         self, pool_id: str
     ) -> list[PoolResource]:
-        data = await self._request("GET", f"/pools/{pool_id}/resources")
+        data = await self._request("GET", f"/pools/{self._e(pool_id)}/resources")
         return [PoolResource.model_validate(d) for d in data]
 
     async def create_pool_resource(
         self, pool_id: str, body: dict[str, Any] | AddResourceRequest
     ) -> PoolResource:
         data = await self._request(
-            "POST", f"/pools/{pool_id}/resources", json=self._body(body)
+            "POST", f"/pools/{self._e(pool_id)}/resources", json=self._body(body)
         )
         return PoolResource.model_validate(data)
 
@@ -643,7 +882,7 @@ class Orch8Client:
         self, pool_id: str, resource_id: str, body: dict[str, Any] | UpdateResourceRequest
     ) -> PoolResource:
         data = await self._request(
-            "PUT", f"/pools/{pool_id}/resources/{resource_id}", json=self._body(body)
+            "PUT", f"/pools/{self._e(pool_id)}/resources/{self._e(resource_id)}", json=self._body(body)
         )
         return PoolResource.model_validate(data)
 
@@ -651,7 +890,7 @@ class Orch8Client:
         self, pool_id: str, resource_id: str
     ) -> None:
         await self._request(
-            "DELETE", f"/pools/{pool_id}/resources/{resource_id}"
+            "DELETE", f"/pools/{self._e(pool_id)}/resources/{self._e(resource_id)}"
         )
 
     # ------------------------------------------------------------------ #
@@ -674,17 +913,17 @@ class Orch8Client:
         return Credential.model_validate(data)
 
     async def get_credential(self, credential_id: str) -> Credential:
-        data = await self._request("GET", f"/credentials/{credential_id}")
+        data = await self._request("GET", f"/credentials/{self._e(credential_id)}")
         return Credential.model_validate(data)
 
     async def delete_credential(self, credential_id: str) -> None:
-        await self._request("DELETE", f"/credentials/{credential_id}")
+        await self._request("DELETE", f"/credentials/{self._e(credential_id)}")
 
     async def update_credential(
         self, credential_id: str, body: dict[str, Any] | UpdateCredentialRequest
     ) -> Credential:
         data = await self._request(
-            "PATCH", f"/credentials/{credential_id}", json=self._body(body)
+            "PATCH", f"/credentials/{self._e(credential_id)}", json=self._body(body)
         )
         return Credential.model_validate(data)
 
@@ -706,17 +945,17 @@ class Orch8Client:
     async def mobile_sync(
         self,
         device_id: str,
-        status_updates: list[StatusUpdatePayload] = [],
-        approval_requests: list[ApprovalRequestPayload] = [],
-        step_delegations: list[StepDelegationPayload] = [],
-        command_acks: list[str] = [],
+        status_updates: list[StatusUpdatePayload] | None = None,
+        approval_requests: list[ApprovalRequestPayload] | None = None,
+        step_delegations: list[StepDelegationPayload] | None = None,
+        command_acks: list[str] | None = None,
     ) -> SyncResponse:
         body = SyncRequest(
             device_id=device_id,
-            status_updates=status_updates,
-            approval_requests=approval_requests,
-            step_delegations=step_delegations,
-            command_acks=command_acks,
+            status_updates=status_updates or [],
+            approval_requests=approval_requests or [],
+            step_delegations=step_delegations or [],
+            command_acks=command_acks or [],
         )
         data = await self._request("POST", "/mobile/sync", json=body.model_dump(exclude_none=True))
         return SyncResponse.model_validate(data)
@@ -749,7 +988,7 @@ class Orch8Client:
     ) -> None:
         body = ResolveApprovalRequest(output=output)
         await self._request(
-            "POST", f"/mobile/approvals/{id}/resolve", json=body.model_dump(exclude_none=True)
+            "POST", f"/mobile/approvals/{self._e(id)}/resolve", json=body.model_dump(exclude_none=True)
         )
 
     async def list_mobile_status(self) -> MobileStatusResponse:
@@ -858,8 +1097,8 @@ class Orch8Client:
         return [RollbackPolicy.model_validate(d) for d in data] if data else []
 
     async def get_rollback_policy(self, name: str) -> RollbackPolicy:
-        data = await self._request("GET", f"/rollback-policies/{name}")
+        data = await self._request("GET", f"/rollback-policies/{self._e(name)}")
         return RollbackPolicy.model_validate(data)
 
     async def delete_rollback_policy(self, name: str) -> None:
-        await self._request("DELETE", f"/rollback-policies/{name}")
+        await self._request("DELETE", f"/rollback-policies/{self._e(name)}")

@@ -35,6 +35,30 @@ def _task(handler_name: str = "test-handler", task_id: str = "wt-1") -> WorkerTa
     )
 
 
+def test_worker_defaults_and_runtime_snapshot(mock_client: Orch8Client) -> None:
+    worker = Orch8Worker(mock_client, "w-1", {"h": AsyncMock()})
+    assert worker.poll_interval == 1.0
+    assert worker.heartbeat_interval == 15.0
+    assert worker.stats() == {
+        "running": False,
+        "in_flight": 0,
+        "available_slots": 10,
+        "handlers": ["h"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_task_timeout_reports_failure(mock_client: Orch8Client) -> None:
+    async def slow_handler(_task: WorkerTask) -> None:
+        await asyncio.sleep(1)
+
+    worker = Orch8Worker(mock_client, "w-1", {"h": slow_handler})
+    task = _task("h")
+    task.timeout_ms = 1
+    await worker._execute(task)
+    mock_client.fail_task.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------

@@ -39,9 +39,9 @@ class Orch8Worker:
         worker_id: str,
         handlers: dict[str, Handler],
         *,
-        poll_interval: float = 2.0,
-        heartbeat_interval: float = 30.0,
-        max_concurrent: int = 5,
+        poll_interval: float = 1.0,
+        heartbeat_interval: float = 15.0,
+        max_concurrent: int = 10,
         circuit_breaker_check: bool = False,
         on_task_complete: Callable[[WorkerTask, Any], None] | None = None,
         on_task_fail: Callable[[WorkerTask, Exception], None] | None = None,
@@ -61,6 +61,15 @@ class Orch8Worker:
         self._on_task_complete = on_task_complete
         self._on_task_fail = on_task_fail
         self._backoff: dict[str, float] = {}
+
+    def stats(self) -> dict[str, Any]:
+        """Return the language-neutral worker runtime snapshot."""
+        return {
+            "running": self._running,
+            "in_flight": self._in_flight,
+            "available_slots": self._max_concurrent - self._in_flight,
+            "handlers": list(self.handlers),
+        }
 
     async def start(self) -> None:
         """Start the polling loop. Blocks until :meth:`stop` is called."""
@@ -164,7 +173,12 @@ class Orch8Worker:
         try:
             handler = self.handlers[task.handler_name]
             heartbeat_handle = asyncio.create_task(self._heartbeat_loop(task.id))
-            output = await handler(task)
+            if task.timeout_ms and task.timeout_ms > 0:
+                output = await asyncio.wait_for(
+                    handler(task), timeout=task.timeout_ms / 1000
+                )
+            else:
+                output = await handler(task)
             await self.client.complete_task(task.id, self.worker_id, output)
             if self._on_task_complete is not None:
                 try:

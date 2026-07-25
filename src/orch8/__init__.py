@@ -21,6 +21,7 @@ from .types import (
     CreateInstanceRequest,
     CreatePoolRequest,
     CreateSessionRequest,
+    CreateSequenceResponse,
     CreateTriggerRequest,
     Credential,
     CronSchedule,
@@ -46,6 +47,10 @@ from .types import (
     MobileStatusResponse,
     MobileApprovalsResponse,
     ResourcePool,
+    RetryConfig,
+    RequestEvent,
+    ResponseEvent,
+    Page,
     RollbackPolicy,
     SequenceDefinition,
     Session,
@@ -65,9 +70,10 @@ from .types import (
     WorkerTask,
 )
 from .worker import Orch8Worker
+from .generated_routes import ORCH8_API_VERSION, ORCH8_ROUTES
 
 try:
-    __version__ = _version("orch8-sdk")
+    __version__ = _version("orch8-io-sdk")
 except Exception:
     __version__ = "unknown"
 
@@ -89,6 +95,7 @@ __all__ = [
     "CreateInstanceRequest",
     "CreatePoolRequest",
     "CreateSessionRequest",
+    "CreateSequenceResponse",
     "CreateTriggerRequest",
     "Credential",
     "CronSchedule",
@@ -116,6 +123,10 @@ __all__ = [
     "MobileStatusResponse",
     "MobileApprovalsResponse",
     "ResourcePool",
+    "RetryConfig",
+    "RequestEvent",
+    "ResponseEvent",
+    "Page",
     "RollbackPolicy",
     "SendSignalRequest",
     "SequenceDefinition",
@@ -134,4 +145,6 @@ __all__ = [
     "UpdateResourceRequest",
     "UpdateStateRequest",
     "WorkerTask",
+    "ORCH8_API_VERSION",
+    "ORCH8_ROUTES",
 ]

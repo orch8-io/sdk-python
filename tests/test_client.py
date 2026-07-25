@@ -1,11 +1,13 @@
 """Tests for Orch8Client using respx to mock httpx."""
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
 
-from orch8 import Orch8Client, Orch8Error
+from orch8 import Orch8Client, Orch8Error, RetryConfig
 from orch8.types import (
     AuditEntry,
     BatchCreateResponse,
@@ -14,6 +16,7 @@ from orch8.types import (
     CircuitBreaker,
     ClusterNode,
     Credential,
+    CreateSequenceResponse,
     CronSchedule,
     ExecutionNode,
     FireTriggerResponse,
@@ -30,6 +33,148 @@ from orch8.types import (
 )
 
 BASE = "http://orch8.test"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_public_request_supports_new_engine_routes() -> None:
+    route = respx.post(f"{BASE}/continuity/handoffs").mock(
+        return_value=httpx.Response(200, json={"id": "handoff-1"})
+    )
+    async with Orch8Client(BASE, tenant_id="tenant-1") as client:
+        result = await client.request(
+            "post", "/continuity/handoffs", json={"execution_id": "exec-1"}
+        )
+
+    assert result == {"id": "handoff-1"}
+    assert route.calls[0].request.headers["X-Tenant-Id"] == "tenant-1"
+
+
+@pytest.mark.asyncio
+async def test_public_request_rejects_protocol_relative_paths() -> None:
+    async with Orch8Client(BASE) as client:
+        with pytest.raises(ValueError, match="exactly one"):
+            await client.request("GET", "//untrusted.test/path")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_safe_requests_retry_transient_failures() -> None:
+    attempts: list[int] = []
+    route = respx.get(f"{BASE}/sequences/seq-1").mock(
+        side_effect=[
+            httpx.Response(429, text="slow down"),
+            httpx.Response(503, text="busy"),
+            httpx.Response(200, json=SEQ_JSON),
+        ]
+    )
+    config = RetryConfig(
+        max_attempts=3,
+        base_delay=0,
+        on_retry=lambda _error, attempt: attempts.append(attempt),
+    )
+    async with Orch8Client(BASE, retry=config) as client:
+        result = await client.get_sequence("seq-1")
+
+    assert result.id == "seq-1"
+    assert len(route.calls) == 3
+    assert attempts == [2, 3]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_dynamic_headers_refresh_before_retry() -> None:
+    tokens = iter(["old", "fresh"])
+    route = respx.get(f"{BASE}/sequences/seq-1").mock(
+        side_effect=[
+            httpx.Response(503, text="busy"),
+            httpx.Response(200, json=SEQ_JSON),
+        ]
+    )
+    async with Orch8Client(
+        BASE,
+        get_headers=lambda: {"Authorization": f"Bearer {next(tokens)}"},
+        retry=RetryConfig(base_delay=0),
+    ) as client:
+        await client.get_sequence("seq-1")
+
+    assert route.calls[0].request.headers["Authorization"] == "Bearer old"
+    assert route.calls[1].request.headers["Authorization"] == "Bearer fresh"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_unsafe_requests_are_not_retried() -> None:
+    route = respx.post(f"{BASE}/instances").mock(
+        return_value=httpx.Response(503, text="busy")
+    )
+    async with Orch8Client(BASE, tenant_id="t-1", retry=RetryConfig(base_delay=0)) as client:
+        with pytest.raises(Orch8Error):
+            await client.create_instance({"sequence_id": "seq-1"})
+
+    assert len(route.calls) == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_observers_and_page_metadata() -> None:
+    responses = []
+    route = respx.get(f"{BASE}/instances").mock(
+        return_value=httpx.Response(
+            200,
+            json={"items": [{"id": "i1"}], "next_cursor": "next", "total": 4},
+        )
+    )
+    async with Orch8Client(
+        BASE,
+        on_request=lambda _event: (_ for _ in ()).throw(RuntimeError("ignored")),
+        on_response=responses.append,
+    ) as client:
+        page = await client.request_page("/instances", {"limit": 1})
+
+    assert route.called
+    assert page.items == [{"id": "i1"}]
+    assert page.next_cursor == "next"
+    assert page.total == 4
+    assert len(responses) == 1
+    assert responses[0].status == 200
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_resource_ids_are_encoded_as_path_segments() -> None:
+    paths = []
+    respx.get(f"{BASE}/sequences/folder%2Fseq").mock(
+        return_value=httpx.Response(200, json=SEQ_JSON)
+    )
+    async with Orch8Client(BASE, on_request=lambda event: paths.append(event.path)) as client:
+        await client.get_sequence("folder/seq")
+
+    assert paths == ["/sequences/folder%2Fseq"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_resumable_stream_exposes_event_id_and_sends_cursor() -> None:
+    route = respx.get(f"{BASE}/instances/inst-1/stream").mock(
+        return_value=httpx.Response(
+            200,
+            text='id: cursor-2\nevent: state\ndata: {"state":"running"}\n\n',
+            headers={"Content-Type": "text/event-stream"},
+        )
+    )
+    async with Orch8Client(BASE) as client:
+        events = [
+            event
+            async for event in client.stream_instance_events(
+                "inst-1", last_event_id="cursor-1"
+            )
+        ]
+
+    assert events == [
+        {"id": "cursor-2", "event": "state", "data": {"state": "running"}}
+    ]
+    assert route.calls[0].request.headers["Last-Event-ID"] == "cursor-1"
 
 # ---------------------------------------------------------------------------
 # Shared minimal payloads
@@ -200,13 +345,17 @@ async def test_404_raises_orch8_error(client: Orch8Client) -> None:
 
 @respx.mock
 async def test_create_sequence(client: Orch8Client) -> None:
-    respx.post(f"{BASE}/sequences").mock(
-        return_value=httpx.Response(201, json=SEQ_JSON)
+    route = respx.post(f"{BASE}/sequences").mock(
+        return_value=httpx.Response(201, json={"id": "seq-1", "warnings": []})
     )
-    result = await client.create_sequence({"name": "my-seq"})
-    assert isinstance(result, SequenceDefinition)
+    result = await client.create_sequence({"name": "my-seq", "blocks": []})
+    assert isinstance(result, CreateSequenceResponse)
     assert result.id == "seq-1"
-    assert result.name == "my-seq"
+    sent = json.loads(route.calls[0].request.content)
+    assert sent["tenant_id"] == "t-1"
+    assert sent["namespace"] == "default"
+    assert sent["status"] == "production"
+    assert sent["version"] == 1
 
 
 @respx.mock
@@ -287,7 +436,9 @@ async def test_batch_create_instances(client: Orch8Client) -> None:
     respx.post(f"{BASE}/instances/batch").mock(
         return_value=httpx.Response(201, json={"created": 3})
     )
-    result = await client.batch_create_instances([{}, {}, {}])
+    result = await client.batch_create_instances(
+        [{"sequence_id": f"seq-{index}"} for index in range(3)]
+    )
     assert isinstance(result, BatchCreateResponse)
     assert result.created == 3
 
@@ -305,7 +456,7 @@ async def test_get_instance(client: Orch8Client) -> None:
 @respx.mock
 async def test_list_instances(client: Orch8Client) -> None:
     respx.get(f"{BASE}/instances").mock(
-        return_value=httpx.Response(200, json=[INSTANCE_JSON])
+        return_value=httpx.Response(200, json={"items": [INSTANCE_JSON], "has_more": False})
     )
     result = await client.list_instances()
     assert isinstance(result, list)
@@ -763,10 +914,15 @@ async def test_fail_task(client: Orch8Client) -> None:
 @respx.mock
 async def test_heartbeat_task(client: Orch8Client) -> None:
     respx.post(f"{BASE}/workers/tasks/wt-1/heartbeat").mock(
-        return_value=httpx.Response(204)
+        return_value=httpx.Response(200, json={"checkpoint_seq": 3})
     )
     result = await client.heartbeat_task("wt-1", "w-1")
-    assert result is None
+    assert result == {"checkpoint_seq": 3}
+
+
+async def test_heartbeat_checkpoint_requires_sequence(client: Orch8Client) -> None:
+    with pytest.raises(ValueError, match="checkpoint_seq is required"):
+        await client.heartbeat_task("wt-1", "w-1", checkpoint={"cursor": 1})
 
 
 # ---------------------------------------------------------------------------
@@ -874,7 +1030,7 @@ CREDENTIAL_JSON = {
 @respx.mock
 async def test_list_sequences(client: Orch8Client) -> None:
     respx.get(f"{BASE}/sequences").mock(
-        return_value=httpx.Response(200, json=[SEQ_JSON])
+        return_value=httpx.Response(200, json={"items": [SEQ_JSON], "has_more": False})
     )
     result = await client.list_sequences()
     assert isinstance(result, list)

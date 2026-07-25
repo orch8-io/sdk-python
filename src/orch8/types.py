@@ -1,9 +1,41 @@
 """Orch8 SDK types — Pydantic models matching the REST API JSON shapes."""
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from typing import Any, Generic, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+T = TypeVar("T")
+
+
+class RetryConfig(BaseModel):
+    """Retry policy for safe management API requests."""
+
+    max_attempts: int = 3
+    base_delay: float = 0.25
+    on_retry: Callable[[Exception, int], None] | None = None
+
+    model_config = {"arbitrary_types_allowed": True}
+
+
+class RequestEvent(BaseModel):
+    method: str
+    path: str
+    attempt: int
+    max_attempts: int
+
+
+class ResponseEvent(RequestEvent):
+    duration_ms: float
+    status: int | None = None
+    error: Any = None
+
+
+class Page(BaseModel, Generic[T]):
+    items: list[T]
+    next_cursor: str | None = None
+    total: int | None = None
 
 
 # --- Core models ---
@@ -16,10 +48,10 @@ class AuditEntry(BaseModel):
 
 
 class ExecutionContext(BaseModel):
-    data: dict[str, Any] = {}
-    config: dict[str, Any] = {}
-    audit: list[AuditEntry] = []
-    runtime: dict[str, Any] = {}
+    data: dict[str, Any] = Field(default_factory=dict)
+    config: dict[str, Any] = Field(default_factory=dict)
+    audit: list[AuditEntry] = Field(default_factory=list)
+    runtime: dict[str, Any] = Field(default_factory=dict)
 
 
 class SequenceDefinition(BaseModel):
@@ -29,9 +61,19 @@ class SequenceDefinition(BaseModel):
     name: str
     version: int
     deprecated: bool = False
-    blocks: list[Any] = []
-    interceptors: list[Any] | None = None
+    blocks: list[Any] = Field(default_factory=list)
+    interceptors: Any = None
+    input_schema: Any = None
+    sla: Any = None
+    on_failure: list[Any] | None = None
+    on_cancel: list[Any] | None = None
+    status: str | None = None
     created_at: str
+
+
+class CreateSequenceResponse(BaseModel):
+    id: str
+    warnings: list[str] | None = None
 
 
 class TaskInstance(BaseModel):
@@ -166,6 +208,8 @@ class WorkerTask(BaseModel):
     output: Any = None
     error_message: str | None = None
     error_retryable: bool | None = None
+    resume_checkpoint: Any = None
+    checkpoint_seq: int = 0
     created_at: str
 
 
@@ -244,7 +288,7 @@ class Credential(BaseModel):
     tenant_id: str
     name: str
     credential_type: str
-    metadata: dict[str, Any] = {}
+    metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str
     updated_at: str
 
@@ -265,7 +309,7 @@ class StatusUpdatePayload(BaseModel):
     handler: str | None = None
     timestamp: str | None = None
     context_summary: Any = None
-    steps: list[Any] = []
+    steps: list[Any] = Field(default_factory=list)
 
 
 class ApprovalRequestPayload(BaseModel):
@@ -273,7 +317,7 @@ class ApprovalRequestPayload(BaseModel):
     block_id: str
     sequence_name: str
     prompt: str
-    choices: list[HumanChoice] = []
+    choices: list[HumanChoice] = Field(default_factory=list)
     store_as: str | None = None
     timeout_seconds: int | None = None
     metadata: Any = None
@@ -295,14 +339,14 @@ class CommandPayload(BaseModel):
 
 class SyncRequest(BaseModel):
     device_id: str
-    status_updates: list[StatusUpdatePayload] = []
-    approval_requests: list[ApprovalRequestPayload] = []
-    step_delegations: list[StepDelegationPayload] = []
-    command_acks: list[str] = []
+    status_updates: list[StatusUpdatePayload] = Field(default_factory=list)
+    approval_requests: list[ApprovalRequestPayload] = Field(default_factory=list)
+    step_delegations: list[StepDelegationPayload] = Field(default_factory=list)
+    command_acks: list[str] = Field(default_factory=list)
 
 
 class SyncResponse(BaseModel):
-    commands: list[CommandPayload] = []
+    commands: list[CommandPayload] = Field(default_factory=list)
     sync_interval_secs: int = 30
 
 
@@ -340,17 +384,17 @@ class MobileStatus(BaseModel):
 
 
 class MobileDevicesResponse(BaseModel):
-    items: list[MobileDevice] = []
+    items: list[MobileDevice] = Field(default_factory=list)
     total: int = 0
 
 
 class MobileApprovalsResponse(BaseModel):
-    items: list[ApprovalItem] = []
+    items: list[ApprovalItem] = Field(default_factory=list)
     total: int = 0
 
 
 class MobileStatusResponse(BaseModel):
-    items: list[MobileStatus] = []
+    items: list[MobileStatus] = Field(default_factory=list)
     total: int = 0
 
 
@@ -398,7 +442,7 @@ class DashboardRow(BaseModel):
 
 
 class DashboardResponse(BaseModel):
-    rows: list[DashboardRow] = []
+    rows: list[DashboardRow] = Field(default_factory=list)
 
 
 # --- Rollback Policies ---
@@ -429,7 +473,7 @@ class ApprovalItem(BaseModel):
     sequence_name: str
     block_id: str
     prompt: str
-    choices: list[HumanChoice] = []
+    choices: list[HumanChoice] = Field(default_factory=list)
     store_as: str | None = None
     timeout_seconds: int | None = None
     escalation_handler: str | None = None
@@ -440,7 +484,7 @@ class ApprovalItem(BaseModel):
 
 
 class ApprovalsResponse(BaseModel):
-    items: list[ApprovalItem] = []
+    items: list[ApprovalItem] = Field(default_factory=list)
     total: int = 0
 
 
@@ -462,6 +506,8 @@ class CreateInstanceRequest(BaseModel):
     session_id: str | None = None
     parent_instance_id: str | None = None
     next_fire_at: str | None = None
+    dry_run: bool | None = None
+    dry_run_auto_approve: bool | None = None
 
 
 class UpdateStateRequest(BaseModel):
