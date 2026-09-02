@@ -55,6 +55,8 @@ class ExecutionContext(BaseModel):
 
 
 class SequenceDefinition(BaseModel):
+    schema_url: str | None = Field(default=None, alias="$schema")
+    schema_version: int = 1
     id: str
     tenant_id: str
     namespace: str
