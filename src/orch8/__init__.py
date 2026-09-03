@@ -2,6 +2,8 @@
 from importlib.metadata import version as _version
 
 from .client import Orch8Client
+from .builder import WorkflowBuilder, workflow
+from .adapters import durable_agent_handler
 from .errors import Orch8Error
 from .types import (
     AddResourceRequest,
@@ -113,6 +115,9 @@ __all__ = [
     "Orch8Client",
     "Orch8Error",
     "Orch8Worker",
+    "WorkflowBuilder",
+    "workflow",
+    "durable_agent_handler",
     "PluginDef",
     "PoolResource",
     "RegisterDeviceRequest",

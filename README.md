@@ -40,6 +40,26 @@ async def main():
 asyncio.run(main())
 ```
 
+## Code-first workflow DSL
+
+```python
+from orch8 import workflow
+
+checkout = (
+    workflow("checkout")
+    .step("charge", "charge", {"customer_id": "cus_123", "cents": 2500})
+    .parallel(
+        "notify",
+        lambda branch: branch.step("email", "send-email", {"template": "receipt"}),
+        lambda branch: branch.step("audit", "write-audit", {}),
+    )
+    .build()
+)
+```
+
+The builder covers all eleven block types and emits the same JSON accepted by
+`create_sequence`; use ordinary `TypedDict` values for handler-specific params.
+
 ```python
 engine_info = await client.request("GET", "/info")
 ```
