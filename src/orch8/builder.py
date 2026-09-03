@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Self
+from typing import Any
 
 Block = dict[str, Any]
 Branch = Callable[["WorkflowBuilder"], None]
@@ -23,19 +23,19 @@ class WorkflowBuilder:
         handler: str,
         params: Mapping[str, Any] | None = None,
         **options: Any,
-    ) -> Self:
+    ) -> WorkflowBuilder:
         self._items.append(
             {"type": "step", "id": id, "handler": handler, "params": dict(params or {}), **options}
         )
         return self
 
-    def parallel(self, id: str, *branches: Branch) -> Self:
+    def parallel(self, id: str, *branches: Branch) -> WorkflowBuilder:
         self._items.append(
             {"type": "parallel", "id": id, "branches": [self._branch(fn) for fn in branches]}
         )
         return self
 
-    def race(self, id: str, *branches: Branch, semantics: str | None = None) -> Self:
+    def race(self, id: str, *branches: Branch, semantics: str | None = None) -> WorkflowBuilder:
         block: Block = {"type": "race", "id": id, "branches": [self._branch(fn) for fn in branches]}
         if semantics is not None:
             block["semantics"] = semantics
@@ -44,7 +44,7 @@ class WorkflowBuilder:
 
     def loop(
         self, id: str, condition: str, body: Branch, *, max_iterations: int = 1000, **options: Any
-    ) -> Self:
+    ) -> WorkflowBuilder:
         self._items.append(
             {
                 "type": "loop",
@@ -59,7 +59,7 @@ class WorkflowBuilder:
 
     def for_each(
         self, id: str, collection: str, body: Branch, *, item_var: str = "item", **options: Any
-    ) -> Self:
+    ) -> WorkflowBuilder:
         self._items.append(
             {
                 "type": "for_each",
@@ -78,7 +78,7 @@ class WorkflowBuilder:
         routes: Sequence[tuple[str, Branch]],
         *,
         default: Branch | None = None,
-    ) -> Self:
+    ) -> WorkflowBuilder:
         block: Block = {
             "type": "router",
             "id": id,
@@ -99,7 +99,7 @@ class WorkflowBuilder:
         catch_block: Branch,
         *,
         finally_block: Branch | None = None,
-    ) -> Self:
+    ) -> WorkflowBuilder:
         block: Block = {
             "type": "try_catch",
             "id": id,
@@ -113,7 +113,7 @@ class WorkflowBuilder:
 
     def sub_sequence(
         self, id: str, sequence_name: str, *, version: int | None = None, input: Any = None
-    ) -> Self:
+    ) -> WorkflowBuilder:
         block: Block = {"type": "sub_sequence", "id": id, "sequence_name": sequence_name}
         if version is not None:
             block["version"] = version
@@ -122,7 +122,9 @@ class WorkflowBuilder:
         self._items.append(block)
         return self
 
-    def ab_split(self, id: str, variants: Sequence[tuple[str, int, Branch]]) -> Self:
+    def ab_split(
+        self, id: str, variants: Sequence[tuple[str, int, Branch]]
+    ) -> WorkflowBuilder:
         self._items.append(
             {
                 "type": "ab_split",
@@ -135,7 +137,7 @@ class WorkflowBuilder:
         )
         return self
 
-    def cancellation_scope(self, id: str, body: Branch) -> Self:
+    def cancellation_scope(self, id: str, body: Branch) -> WorkflowBuilder:
         self._items.append(
             {"type": "cancellation_scope", "id": id, "blocks": self._branch(body)}
         )
@@ -145,7 +147,7 @@ class WorkflowBuilder:
         self,
         id: str,
         steps: Sequence[tuple[str, Branch, Branch | None]],
-    ) -> Self:
+    ) -> WorkflowBuilder:
         resolved = []
         for step_id, action, compensation in steps:
             actions = self._branch(action)
@@ -159,7 +161,7 @@ class WorkflowBuilder:
         self._items.append({"type": "saga", "id": id, "steps": resolved})
         return self
 
-    def raw(self, block: Mapping[str, Any]) -> Self:
+    def raw(self, block: Mapping[str, Any]) -> WorkflowBuilder:
         self._items.append(dict(block))
         return self
 
