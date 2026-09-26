@@ -6,13 +6,23 @@ Python SDK for the [Orch8](https://orch8.io) workflow engine.
 
 ```bash
 pip install orch8-io-sdk
+# optional integrations
+pip install "orch8-io-sdk[fastapi]"        # push-dispatch router
+pip install "orch8-io-sdk[django]"         # push-dispatch view
+pip install "orch8-io-sdk[langgraph]"      # durable LangGraph turns
+pip install "orch8-io-sdk[openai-agents]"  # durable OpenAI Agents tools
 ```
 
 Requires Python 3.10+.
 
-Version 0.3 understands the current Orch8 0.7-dev response contract for sequence lifecycle
-metadata and resumable worker checkpoints. New or experimental engine routes
-are immediately available through the safe low-level `request()` method.
+Version 0.7 tracks the Orch8 0.7 sequence contract, matching the Node SDK:
+sagas and per-step compensation, conditional steps (`when` guards), filtered
+retries (`retry_if`, `non_retryable_codes`), output schemas, local-time delays
+(`fire_at_local` + `timezone`), and bounded loop history (`retain_iterations`).
+Workers follow the engine lease protocol (`claim_epoch` on every
+acknowledgement, server poll/heartbeat hints). Portable continuity APIs are
+available under `client.continuity`. New or experimental engine routes are
+reachable through the authenticated low-level `request()` method.
 
 ## Quick Start
 
@@ -58,7 +68,32 @@ checkout = (
 ```
 
 The builder covers all eleven block types and emits the same JSON accepted by
-`create_sequence`; use ordinary `TypedDict` values for handler-specific params.
+`create_sequence`; `build()` validates it against the 0.7 contract (unknown
+fields, duplicate ids, retry and loop bounds). Step options are typed
+(`orch8.StepOptions`):
+
+```python
+from orch8 import delay, retry_policy, workflow
+
+onboarding = (
+    workflow("onboarding")
+    .input_schema({"type": "object", "required": ["email"]})
+    .step(
+        "charge", "charge", {"cents": 2500},
+        when='data.plan == "pro"',
+        retry=retry_policy(3, 500, 10_000, non_retryable_codes=["card_declined"]),
+        output_schema={"type": "object", "required": ["charge_id"]},
+        compensation={"handler": "refund"},
+    )
+    .delay(delay(fire_at_local="2026-03-09T09:00:00", timezone="America/New_York"))
+    .loop("poll", "data.pending", lambda b: b.step("check", "check"), retain_iterations=10)
+    .on_failure(lambda b: b.step("alert", "alert"))
+    .build()
+)
+```
+
+`validate_sequence(definition, native=True)` additionally applies the
+engine's own strict validator when the native bindings are installed.
 
 ```python
 engine_info = await client.request("GET", "/info")
@@ -127,6 +162,121 @@ async def main():
 asyncio.run(main())
 ```
 
+The worker echoes each task's `claim_epoch` on heartbeat, completion, and
+failure, respects the server's `poll_after_ms`, and heartbeats no less often
+than the advertised interval or half the lease. A rejected or ambiguous
+completion is left for lease recovery rather than reported as a failure.
+Pass `queue="name"` to claim from a named queue. Use
+`client.poll_task_batch()` for the lease hints in custom loops.
+
+Inside a handler, `current_task()` exposes durable checkpoints that survive
+retries and lease reclaims:
+
+```python
+from orch8 import current_task
+
+async def scan(task):
+    ctx = current_task()
+    page = (ctx.resume_checkpoint or {}).get("page", 0)
+    for page in range(page, 100):
+        await process(page, idempotency_key=f"{ctx.idempotency_prefix}:{page}")
+        await ctx.checkpoint({"page": page + 1})
+    return {"pages": 100}
+```
+
+## Background jobs
+
+`client.jobs` enqueues single durable handler invocations with retries,
+delays and idempotency (requires an engine with the `/jobs` API):
+
+```python
+job = await client.jobs.enqueue(
+    "send_email", {"to": "ada@example.com"},
+    retry={"max_attempts": 5, "initial_backoff_ms": 1_000},
+    delay_ms=60_000, idempotency_key="welcome:ada",
+)
+done = await client.jobs.wait_for(job.id, timeout=300)
+async for failed in client.jobs.list(status="failed"):
+    print(failed.id, failed.error)
+await client.jobs.cancel(job.id)
+```
+
+## Push dispatch
+
+Queues in push mode make the engine POST a signed envelope to your endpoint.
+`PushDispatcher` verifies `X-Orch8-Signature` (HMAC-SHA256 over
+`"{timestamp}.{body}"`, constant-time, 5-minute replay window), then claims
+from the envelope's queue and runs the handler with the normal lease
+protocol — a pushed task is still pending, and the envelope carries no lease,
+so a verified push acts as a wake-up. Duplicate pushes find nothing to claim.
+
+```python
+from orch8.push import PushDispatcher
+
+dispatcher = PushDispatcher(client, {"resize": resize}, secret=os.environ["ORCH8_PUSH_SECRET"])
+
+# AWS Lambda (API Gateway v1/v2 or Function URL) — no AWS dependency
+from orch8.integrations.aws_lambda import lambda_handler
+handler = lambda_handler(dispatcher)
+
+# FastAPI
+from orch8.integrations.fastapi import push_router
+app.include_router(push_router(dispatcher, path="/orch8/push"))
+
+# Django
+from orch8.integrations.django import push_view
+urlpatterns = [path("orch8/push", push_view(dispatcher))]
+```
+
+`orch8.integrations.asgi.PushASGIApp` and `orch8.integrations.wsgi.push_wsgi_app`
+cover other frameworks; `verify_push_signature()` is available on its own and
+also verifies outbound webhooks, which use the same scheme.
+
+## Testing
+
+`orch8.testing.FakeEngine` is a pure-Python engine stand-in: worker poll,
+queue poll, complete, fail and heartbeat with lease epochs and reaping;
+instances running linear `step` sequences with retries, delays and durable
+checkpoints; and the jobs API — all on a virtual clock that skips time.
+
+```python
+# conftest.py
+pytest_plugins = ["orch8.testing.pytest_plugin"]
+
+# test_checkout.py
+async def test_checkout(orch8_engine, orch8_client):
+    inst = await orch8_engine.run(orch8_client, checkout, {"charge": charge})
+    assert inst.state == "completed"
+```
+
+`orch8_engine.serve()` exposes the same fake over loopback HTTP. For full DSL
+semantics on the real engine, `orch8.testing.NativeEnvironment` (fixture
+`orch8_native`) runs sequences in-memory with time skipping through the
+`orch8-engine-native` PyO3 bindings, built from `engine/packages/python-native`
+with maturin (not yet published to PyPI).
+
+## Durable AI agents
+
+Adapters follow the engine's framework-adapter contract: portable state only,
+one framework turn per worker task, checkpoints at turn boundaries.
+
+```python
+from orch8.ai import turn_loop
+from orch8.ai.langgraph import langgraph_turn_handler
+from orch8.ai.openai_agents import openai_agent_turn_handler
+
+handlers = {
+    "support_turn": langgraph_turn_handler(graph, portable_keys={"messages"}),
+    "billing_turn": openai_agent_turn_handler(billing_agent),
+}
+support = turn_loop(workflow("support"), "chat", "support_turn", max_turns=20).build()
+```
+
+The OpenAI Agents adapter journals every function-tool result by
+`tool_call_id` in the task's durable checkpoint, so a retried turn reuses it
+instead of repeating the side effect; `tool_idempotency_key()` gives tools a
+stable key to pass to providers.
+
 ## Error Handling
 
 ```python
@@ -141,9 +291,6 @@ except Orch8Error as exc:
 ## Development
 
 ```bash
-# Install in editable mode with dev dependencies
-pip install -e ".[dev]"
-
-# Run tests
-pytest
+uv sync --extra dev
+uv run pytest
 ```
