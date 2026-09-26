@@ -78,7 +78,7 @@ class ToolJournal:
     def for_current_task(cls, *, match_arguments: bool = True) -> ToolJournal:
         ctx = current_task()
         checkpoint = ctx.resume_checkpoint if ctx else None
-        entries = {}
+        entries: dict[str, Any] = {}
         extra: dict[str, Any] = {}
         if isinstance(checkpoint, dict):
             entries = checkpoint.get(_JOURNAL_KEY) or {}
@@ -178,7 +178,8 @@ def openai_agent_turn_handler(
 
     async def handle(task: WorkerTask) -> dict[str, Any]:
         context = task.context if isinstance(task.context, dict) else {}
-        data = context.get("data") if isinstance(context.get("data"), dict) else {}
+        raw_data = context.get("data")
+        data: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
         history = list(data.get(history_key) or [])
         params = task.params if isinstance(task.params, dict) else {}
         new_input = params.get(input_key)

@@ -610,7 +610,7 @@ class FakeEngine:
             raise _HttpError(400, "handler_name and worker_id are required")
         limit = min(int(body.get("limit") or 1), 1000)
         now = self.clock.now()
-        claimed = []
+        claimed: list[dict[str, Any]] = []
         for task in self.tasks.values():
             if len(claimed) >= limit:
                 break
