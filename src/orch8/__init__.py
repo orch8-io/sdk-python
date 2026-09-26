@@ -2,6 +2,7 @@
 from importlib.metadata import version as _version
 
 from .client import Orch8Client
+from .continuity import ContinuityClient
 from .builder import WorkflowBuilder, workflow
 from .dsl import (
     DelaySpec,
@@ -123,6 +124,7 @@ __all__ = [
     "IngestResponse",
     "IngestTelemetryRequest",
     "Orch8Client",
+    "ContinuityClient",
     "Orch8Error",
     "Orch8Worker",
     "WorkflowBuilder",

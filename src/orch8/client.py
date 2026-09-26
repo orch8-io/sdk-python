@@ -14,6 +14,7 @@ from urllib.parse import quote
 import httpx
 from pydantic import BaseModel
 
+from .continuity import ContinuityClient
 from .errors import Orch8Error
 from .types import (
     AddResourceRequest,
@@ -88,6 +89,7 @@ class Orch8Client:
         timeout: float = 30.0,
         on_request: Callable[[RequestEvent], None] | None = None,
         on_response: Callable[[ResponseEvent], None] | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         h: dict[str, str] = {"Content-Type": "application/json"}
         if tenant_id:
@@ -101,8 +103,13 @@ class Orch8Client:
         self.on_request = on_request
         self.on_response = on_response
         self._http = httpx.AsyncClient(
-            base_url=self.base_url, headers=self.headers, timeout=timeout
+            base_url=self.base_url,
+            headers=self.headers,
+            timeout=timeout,
+            transport=transport,
         )
+        #: Portable-continuity control plane (executions, handoffs, effects).
+        self.continuity = ContinuityClient(self)
 
     # -- context manager --
 
