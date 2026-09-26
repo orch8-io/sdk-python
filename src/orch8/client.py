@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from .continuity import ContinuityClient
 from .errors import Orch8Error
+from .jobs import JobsClient
 from .types import (
     AddResourceRequest,
     ApprovalItem,
@@ -110,6 +111,8 @@ class Orch8Client:
         )
         #: Portable-continuity control plane (executions, handoffs, effects).
         self.continuity = ContinuityClient(self)
+        #: Background jobs (``POST /jobs`` and friends).
+        self.jobs = JobsClient(self)
 
     # -- context manager --
 

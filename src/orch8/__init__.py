@@ -15,6 +15,7 @@ from .dsl import (
 )
 from .adapters import durable_agent_handler
 from .errors import Orch8Error
+from .jobs import Job, JobAttempt, JobPage, JobRetry, JobsClient, JobStatus, JobTimeoutError
 from .types import (
     AddResourceRequest,
     ApprovalItem,
@@ -126,6 +127,13 @@ __all__ = [
     "Orch8Client",
     "ContinuityClient",
     "Orch8Error",
+    "Job",
+    "JobAttempt",
+    "JobPage",
+    "JobRetry",
+    "JobsClient",
+    "JobStatus",
+    "JobTimeoutError",
     "Orch8Worker",
     "WorkflowBuilder",
     "workflow",
