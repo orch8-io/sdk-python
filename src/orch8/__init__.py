@@ -69,9 +69,10 @@ from .types import (
     UpdateCronRequest,
     UpdateResourceRequest,
     UpdateStateRequest,
+    WorkerPollResponse,
     WorkerTask,
 )
-from .worker import Orch8Worker
+from .worker import Orch8Worker, TaskContext, current_task
 from .generated_routes import ORCH8_API_VERSION, ORCH8_ROUTES
 
 try:
@@ -149,7 +150,10 @@ __all__ = [
     "UpdateCronRequest",
     "UpdateResourceRequest",
     "UpdateStateRequest",
+    "WorkerPollResponse",
     "WorkerTask",
+    "TaskContext",
+    "current_task",
     "ORCH8_API_VERSION",
     "ORCH8_ROUTES",
 ]

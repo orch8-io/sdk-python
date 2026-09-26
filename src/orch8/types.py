@@ -213,6 +213,17 @@ class WorkerTask(BaseModel):
     resume_checkpoint: Any = None
     checkpoint_seq: int = 0
     created_at: str
+    # Ownership epoch returned by the server; echo it on every acknowledgement.
+    claim_epoch: int | None = None
+
+
+class WorkerPollResponse(BaseModel):
+    """Poll result. Hints are absent only on legacy array-returning servers."""
+
+    tasks: list[WorkerTask]
+    lease_secs: float | None = None
+    heartbeat_interval_secs: float | None = None
+    poll_after_ms: float | None = None
 
 
 # --- Cluster ---

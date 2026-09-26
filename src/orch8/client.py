@@ -68,6 +68,7 @@ from .types import (
     UpdateCronRequest,
     UpdateResourceRequest,
     UpdateStateRequest,
+    WorkerPollResponse,
     WorkerTask,
 )
 
@@ -705,7 +706,20 @@ class Orch8Client:
         handler_name: str,
         worker_id: str,
         limit: int = 1,
+        **extra: Any,
     ) -> list[WorkerTask]:
+        """Claim tasks for ``handler_name``; see :meth:`poll_task_batch` for hints."""
+        batch = await self.poll_task_batch(handler_name, worker_id, limit, **extra)
+        return batch.tasks
+
+    async def poll_task_batch(
+        self,
+        handler_name: str,
+        worker_id: str,
+        limit: int = 1,
+        **extra: Any,
+    ) -> WorkerPollResponse:
+        """Claim tasks and keep the lease/heartbeat/poll-delay hints."""
         data = await self._request(
             "POST",
             "/workers/tasks/poll",
@@ -713,17 +727,26 @@ class Orch8Client:
                 "handler_name": handler_name,
                 "worker_id": worker_id,
                 "limit": limit,
+                **extra,
             },
         )
-        return [WorkerTask.model_validate(d) for d in data]
+        return decode_worker_poll(data)
 
     async def complete_task(
-        self, task_id: str, worker_id: str, output: Any
+        self,
+        task_id: str,
+        worker_id: str,
+        output: Any,
+        *,
+        claim_epoch: int | None = None,
     ) -> None:
+        body: dict[str, Any] = {"worker_id": worker_id, "output": output}
+        if claim_epoch is not None:
+            body["claim_epoch"] = claim_epoch
         await self._request(
             "POST",
             f"/workers/tasks/{self._e(task_id)}/complete",
-            json={"worker_id": worker_id, "output": output},
+            json=body,
         )
 
     async def fail_task(
@@ -732,15 +755,20 @@ class Orch8Client:
         worker_id: str,
         message: str,
         retryable: bool = False,
+        *,
+        claim_epoch: int | None = None,
     ) -> None:
+        body: dict[str, Any] = {
+            "worker_id": worker_id,
+            "message": message,
+            "retryable": retryable,
+        }
+        if claim_epoch is not None:
+            body["claim_epoch"] = claim_epoch
         await self._request(
             "POST",
             f"/workers/tasks/{self._e(task_id)}/fail",
-            json={
-                "worker_id": worker_id,
-                "message": message,
-                "retryable": retryable,
-            },
+            json=body,
         )
 
     async def heartbeat_task(
@@ -750,8 +778,11 @@ class Orch8Client:
         *,
         checkpoint: Any = None,
         checkpoint_seq: int | None = None,
+        claim_epoch: int | None = None,
     ) -> dict[str, int]:
         body: dict[str, Any] = {"worker_id": worker_id}
+        if claim_epoch is not None:
+            body["claim_epoch"] = claim_epoch
         if checkpoint is not None:
             if checkpoint_seq is None:
                 raise ValueError("checkpoint_seq is required with checkpoint")
@@ -777,13 +808,33 @@ class Orch8Client:
         handler_name: str,
         worker_id: str,
         limit: int = 1,
+        **extra: Any,
     ) -> list[WorkerTask]:
+        batch = await self.poll_task_batch_from_queue(
+            queue, handler_name, worker_id, limit, **extra
+        )
+        return batch.tasks
+
+    async def poll_task_batch_from_queue(
+        self,
+        queue: str,
+        handler_name: str,
+        worker_id: str,
+        limit: int = 1,
+        **extra: Any,
+    ) -> WorkerPollResponse:
         data = await self._request(
             "POST",
             "/workers/tasks/poll/queue",
-            json={"queue_name": queue, "handler_name": handler_name, "worker_id": worker_id, "limit": limit},
+            json={
+                "queue_name": queue,
+                "handler_name": handler_name,
+                "worker_id": worker_id,
+                "limit": limit,
+                **extra,
+            },
         )
-        return [WorkerTask.model_validate(d) for d in data]
+        return decode_worker_poll(data)
 
     # ------------------------------------------------------------------ #
     # Cluster
@@ -1102,3 +1153,26 @@ class Orch8Client:
 
     async def delete_rollback_policy(self, name: str) -> None:
         await self._request("DELETE", f"/rollback-policies/{self._e(name)}")
+
+
+_POLL_HINTS = ("lease_secs", "heartbeat_interval_secs", "poll_after_ms")
+
+
+def decode_worker_poll(value: Any) -> WorkerPollResponse:
+    """Decode a poll response, accepting the legacy bare-array shape."""
+    if isinstance(value, list):
+        return WorkerPollResponse(tasks=[WorkerTask.model_validate(t) for t in value])
+    if not isinstance(value, dict) or not isinstance(value.get("tasks"), list):
+        raise TypeError("worker poll response must contain a tasks array")
+    for key in _POLL_HINTS:
+        if key not in value:
+            continue
+        hint = value[key]
+        if (
+            isinstance(hint, bool)
+            or not isinstance(hint, (int, float))
+            or hint < 0
+            or (key != "poll_after_ms" and hint == 0)
+        ):
+            raise TypeError(f"invalid worker poll hint: {key}")
+    return WorkerPollResponse.model_validate(value)

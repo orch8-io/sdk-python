@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from orch8 import Orch8Client
-from orch8.types import WorkerTask
+from orch8.types import WorkerPollResponse, WorkerTask
 from orch8.worker import Orch8Worker
 
 
@@ -22,6 +22,12 @@ def mock_client() -> Orch8Client:
     client.get_circuit_breaker = AsyncMock(
         return_value=MagicMock(state="closed")
     )
+
+    async def poll_task_batch(**kwargs: Any) -> WorkerPollResponse:
+        # Tests script ``poll_tasks``; the worker consumes the batch form.
+        return WorkerPollResponse(tasks=await client.poll_tasks(**kwargs))
+
+    client.poll_task_batch = AsyncMock(side_effect=poll_task_batch)
     return client
 
 
