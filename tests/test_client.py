@@ -1339,3 +1339,15 @@ async def test_reset_tenant_circuit_breaker(client: Orch8Client) -> None:
     )
     result = await client.reset_tenant_circuit_breaker("t-1", "my-handler")
     assert result is None
+
+
+@respx.mock
+async def test_mobile_list_methods_resolve_response_models(client: Orch8Client) -> None:
+    respx.get(f"{BASE}/mobile/devices").mock(
+        return_value=httpx.Response(200, json={"items": [], "total": 0})
+    )
+    respx.get(f"{BASE}/mobile/status").mock(
+        return_value=httpx.Response(200, json={"items": [], "total": 0})
+    )
+    assert (await client.list_mobile_devices()).total == 0
+    assert (await client.list_mobile_status()).total == 0
