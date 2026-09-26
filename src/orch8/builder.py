@@ -5,6 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from typing_extensions import Unpack
+
+from .dsl import DelaySpec, StepOptions, validate_sequence
+
 Block = dict[str, Any]
 Branch = Callable[["WorkflowBuilder"], None]
 
@@ -16,16 +20,28 @@ class WorkflowBuilder:
         self.name = name
         self.namespace = namespace
         self._items: list[Block] = []
+        self._extra: Block = {}
 
     def step(
         self,
         id: str,
         handler: str,
         params: Mapping[str, Any] | None = None,
-        **options: Any,
+        **options: Unpack[StepOptions],
     ) -> WorkflowBuilder:
+        """Append a step. Options include ``when`` guards, ``retry`` (with
+        ``retry_if`` / ``non_retryable_codes`` filters), ``output_schema``,
+        local-time ``delay`` and per-step ``compensation``."""
         self._items.append(
             {"type": "step", "id": id, "handler": handler, "params": dict(params or {}), **options}
+        )
+        return self
+
+    def delay(self, spec: DelaySpec, id: str | None = None) -> WorkflowBuilder:
+        """Append a durable wait as a ``noop`` step carrying ``spec``."""
+        block_id = id or f"delay_{len(self._items)}"
+        self._items.append(
+            {"type": "step", "id": block_id, "handler": "noop", "params": {}, "delay": dict(spec)}
         )
         return self
 
@@ -43,8 +59,18 @@ class WorkflowBuilder:
         return self
 
     def loop(
-        self, id: str, condition: str, body: Branch, *, max_iterations: int = 1000, **options: Any
+        self,
+        id: str,
+        condition: str,
+        body: Branch,
+        *,
+        max_iterations: int = 1000,
+        retain_iterations: int | None = None,
+        **options: Any,
     ) -> WorkflowBuilder:
+        """Append a loop; ``retain_iterations`` bounds stored iteration history."""
+        if retain_iterations is not None:
+            options["retain_iterations"] = retain_iterations
         self._items.append(
             {
                 "type": "loop",
@@ -58,8 +84,17 @@ class WorkflowBuilder:
         return self
 
     def for_each(
-        self, id: str, collection: str, body: Branch, *, item_var: str = "item", **options: Any
+        self,
+        id: str,
+        collection: str,
+        body: Branch,
+        *,
+        item_var: str = "item",
+        retain_iterations: int | None = None,
+        **options: Any,
     ) -> WorkflowBuilder:
+        if retain_iterations is not None:
+            options["retain_iterations"] = retain_iterations
         self._items.append(
             {
                 "type": "for_each",
@@ -165,8 +200,31 @@ class WorkflowBuilder:
         self._items.append(dict(block))
         return self
 
-    def build(self) -> Block:
-        return {"name": self.name, "namespace": self.namespace, "blocks": list(self._items)}
+    def on_failure(self, body: Branch) -> WorkflowBuilder:
+        """Best-effort cleanup blocks run when the instance fails."""
+        self._extra["on_failure"] = self._branch(body)
+        return self
+
+    def on_cancel(self, body: Branch) -> WorkflowBuilder:
+        self._extra["on_cancel"] = self._branch(body)
+        return self
+
+    def input_schema(self, schema: Mapping[str, Any]) -> WorkflowBuilder:
+        """JSON Schema that instance input is validated against."""
+        self._extra["input_schema"] = dict(schema)
+        return self
+
+    def build(self, *, validate: bool = True) -> Block:
+        """Return the ``create_sequence`` payload, validated by default."""
+        payload: Block = {
+            "name": self.name,
+            "namespace": self.namespace,
+            "blocks": list(self._items),
+            **self._extra,
+        }
+        if validate:
+            validate_sequence(payload)
+        return payload
 
     def _branch(self, callback: Branch) -> list[Block]:
         inner = WorkflowBuilder("_inner", self.namespace)

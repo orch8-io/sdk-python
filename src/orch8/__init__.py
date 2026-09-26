@@ -3,6 +3,15 @@ from importlib.metadata import version as _version
 
 from .client import Orch8Client
 from .builder import WorkflowBuilder, workflow
+from .dsl import (
+    DelaySpec,
+    RetryPolicy,
+    SequenceValidationError,
+    StepOptions,
+    delay,
+    retry_policy,
+    validate_sequence,
+)
 from .adapters import durable_agent_handler
 from .errors import Orch8Error
 from .types import (
@@ -118,6 +127,13 @@ __all__ = [
     "Orch8Worker",
     "WorkflowBuilder",
     "workflow",
+    "DelaySpec",
+    "RetryPolicy",
+    "SequenceValidationError",
+    "StepOptions",
+    "delay",
+    "retry_policy",
+    "validate_sequence",
     "durable_agent_handler",
     "PluginDef",
     "PoolResource",
